@@ -1,0 +1,4 @@
+aiohttp>=3.9,<4
+maxapi-python>=1.2.4
+requests
+python-dotenv>=1.0,<2

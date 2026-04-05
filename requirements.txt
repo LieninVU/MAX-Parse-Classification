@@ -1,0 +1,10 @@
+# Парсер
+aiohttp>=3.9,<4
+maxapi-python>=1.2.4
+requests
+
+# Сервер
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2,<3
+httpx>=0.27,<1
