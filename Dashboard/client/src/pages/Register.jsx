@@ -4,9 +4,7 @@
 
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import axios from 'axios';
-
-const API_URL = '/api';
+import api from '../lib/api';
 
 export default function Register() {
   const [username, setUsername] = useState('');
@@ -23,7 +21,6 @@ export default function Register() {
     setError('');
     setSuccess(false);
 
-    // Валидация на клиенте
     if (password !== confirmPassword) {
       setError('Пароли не совпадают');
       return;
@@ -40,9 +37,8 @@ export default function Register() {
     setLoading(true);
 
     try {
-      await axios.post(`${API_URL}/auth/register`, { username, password });
+      await api.post('/auth/register', { username, password });
       setSuccess(true);
-      // Через 1.5 с редирект на логин
       setTimeout(() => navigate('/login'), 1500);
     } catch (err) {
       setError(err.response?.data?.error || 'Ошибка регистрации');
@@ -73,9 +69,7 @@ export default function Register() {
           )}
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
-              Логин
-            </label>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Логин</label>
             <input
               type="text"
               value={username}
@@ -88,9 +82,7 @@ export default function Register() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
-              Пароль
-            </label>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Пароль</label>
             <input
               type="password"
               value={password}
@@ -103,9 +95,7 @@ export default function Register() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
-              Подтверждение пароля
-            </label>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Подтверждение пароля</label>
             <input
               type="password"
               value={confirmPassword}

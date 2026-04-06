@@ -1,28 +1,25 @@
 /**
  * AuthContext.jsx — React Context для управления авторизацией.
  * Хранит токен и данные пользователя в localStorage + state.
+ *
+ * Использует api.js (с interceptors) вместо мутации axios.defaults.
  */
 
 import { createContext, useContext, useState, useEffect } from 'react';
-import axios from 'axios';
 
 const AuthContext = createContext(null);
-
-const API_URL = '/api'; // Проксируется через Vite на localhost:5000
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  // При монтировании проверяем, есть ли сохранённый токен
+  // При монтировании проверяем сохранённый токен
   useEffect(() => {
     const savedUser = localStorage.getItem('dashboard_user');
     const savedToken = localStorage.getItem('dashboard_token');
 
     if (savedUser && savedToken) {
       setUser(JSON.parse(savedUser));
-      // Устанавливаем токен для всех будущих axios-запросов
-      axios.defaults.headers.common['Authorization'] = `Bearer ${savedToken}`;
     }
     setLoading(false);
   }, []);
@@ -31,7 +28,6 @@ export function AuthProvider({ children }) {
   const login = (token, userData) => {
     localStorage.setItem('dashboard_token', token);
     localStorage.setItem('dashboard_user', JSON.stringify(userData));
-    axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
     setUser(userData);
   };
 
@@ -39,7 +35,6 @@ export function AuthProvider({ children }) {
   const logout = () => {
     localStorage.removeItem('dashboard_token');
     localStorage.removeItem('dashboard_user');
-    delete axios.defaults.headers.common['Authorization'];
     setUser(null);
   };
 

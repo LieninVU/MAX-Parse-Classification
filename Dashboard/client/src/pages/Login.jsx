@@ -4,10 +4,8 @@
 
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import axios from 'axios';
+import api from '../lib/api';
 import { useAuth } from '../context/AuthContext';
-
-const API_URL = '/api';
 
 export default function Login() {
   const [username, setUsername] = useState('');
@@ -24,7 +22,7 @@ export default function Login() {
     setLoading(true);
 
     try {
-      const res = await axios.post(`${API_URL}/auth/login`, { username, password });
+      const res = await api.post('/auth/login', { username, password });
       login(res.data.token, res.data.user);
       navigate('/dashboard');
     } catch (err) {
@@ -37,13 +35,11 @@ export default function Login() {
   return (
     <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-slate-800 to-slate-900">
       <div className="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md">
-        {/* Заголовок */}
         <div className="text-center mb-8">
           <h1 className="text-3xl font-bold text-slate-800">🏙️ Admin Dashboard</h1>
           <p className="text-slate-500 mt-2">Войдите для управления инцидентами</p>
         </div>
 
-        {/* Форма */}
         <form onSubmit={handleSubmit} className="space-y-5">
           {error && (
             <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
@@ -52,9 +48,7 @@ export default function Login() {
           )}
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
-              Логин
-            </label>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Логин</label>
             <input
               type="text"
               value={username}
@@ -67,9 +61,7 @@ export default function Login() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">
-              Пароль
-            </label>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Пароль</label>
             <input
               type="password"
               value={password}
@@ -90,7 +82,6 @@ export default function Login() {
           </button>
         </form>
 
-        {/* Ссылка на регистрацию */}
         <p className="mt-6 text-center text-sm text-slate-500">
           Нет аккаунта?{' '}
           <Link to="/register" className="text-blue-600 hover:underline font-medium">

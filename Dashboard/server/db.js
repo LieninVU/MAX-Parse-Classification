@@ -1,36 +1,16 @@
 /**
  * db.js — Инициализация SQLite, создание таблиц, сидирование пользователя admin/admin.
- * Использует better-sqlite3 (синхронный, с промис-обёрткой для удобства).
+ *
+ * Ожидает, что переменные окружения (DB_PATH) уже загружены
+ * через dotenv.config() в server.js.
  */
 
 const Database = require('better-sqlite3');
-const bcrypt = require('bcryptjs');
 const path = require('path');
 const fs = require('fs');
 
-// ---------------------------------------------------------------------------
-// Загрузка .env вручную (без зависимости dotenv в этом файле для простоты)
-// Лучше использовать dotenv в server.js, а сюда передавать готовый конфиг.
-// Но для автономности — читаем .env здесь.
-// ---------------------------------------------------------------------------
-
-function loadEnv() {
-  const envPath = path.join(__dirname, '.env');
-  if (fs.existsSync(envPath)) {
-    const content = fs.readFileSync(envPath, 'utf-8');
-    content.split('\n').forEach((line) => {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith('#')) {
-        const [key, ...rest] = trimmed.split('=');
-        process.env[key.trim()] = rest.join('=').trim();
-      }
-    });
-  }
-}
-
-loadEnv();
-
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '../../AI/analytics.db');
+const DB_PATH =
+  process.env.DB_PATH || path.join(__dirname, '../../AI/analytics.db');
 
 // Убеждаемся, что директория БД существует
 const dbDir = path.dirname(DB_PATH);
@@ -43,24 +23,24 @@ if (!fs.existsSync(dbDir)) {
 // ---------------------------------------------------------------------------
 const db = new Database(DB_PATH);
 
-// Включаем WAL-режим для лучшей конкурентности (FastAPI + Express работают с одной БД)
+// WAL-режим для конкурентного доступа (FastAPI + Express работают с одной БД)
 db.pragma('journal_mode = WAL');
 
 // ---------------------------------------------------------------------------
-// SQL: таблица пользователей (новая)
+// SQL: таблица пользователей
 // ---------------------------------------------------------------------------
 const SQL_CREATE_USERS = `
   CREATE TABLE IF NOT EXISTS dashboard_users (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     username  TEXT    NOT NULL UNIQUE,
-    password  TEXT    NOT NULL,          -- bcrypt-хеш
+    password  TEXT    NOT NULL,
     role      TEXT    NOT NULL DEFAULT 'admin',
     created_at TEXT   NOT NULL DEFAULT (datetime('now'))
   )
 `;
 
 // ---------------------------------------------------------------------------
-// SQL: убедимся, что actionable_posts существует (совместимость с FastAPI)
+// SQL: таблица инцидентов (совместимость с FastAPI-analytics_server.py)
 // ---------------------------------------------------------------------------
 const SQL_CREATE_ACTIONABLE = `
   CREATE TABLE IF NOT EXISTS actionable_posts (
@@ -92,17 +72,37 @@ const SQL_INDEXES = [
 ];
 
 // ---------------------------------------------------------------------------
-// Сидирование: создаём admin/admin, если пользователей нет
+// Prepared-стейтменты (кешируем — better-sqlite3 рекомендует)
+// ---------------------------------------------------------------------------
+const stmt = {
+  countUsers: db.prepare('SELECT COUNT(*) as cnt FROM dashboard_users'),
+  insertUser: db.prepare(
+    'INSERT INTO dashboard_users (username, password, role) VALUES (?, ?, ?)'
+  ),
+  findUser: db.prepare(
+    'SELECT * FROM dashboard_users WHERE username = ?'
+  ),
+  createUser: db.prepare(
+    'INSERT INTO dashboard_users (username, password) VALUES (?, ?)'
+  ),
+  deletePost: db.prepare(
+    'DELETE FROM actionable_posts WHERE id = ?'
+  ),
+  getCategories: db.prepare(
+    'SELECT DISTINCT category FROM actionable_posts ORDER BY category'
+  ),
+};
+
+// ---------------------------------------------------------------------------
+// Сидирование
 // ---------------------------------------------------------------------------
 function seedDefaultUser() {
-  const count = db.prepare('SELECT COUNT(*) as cnt FROM dashboard_users').get();
+  const { cnt } = stmt.countUsers.get();
 
-  if (count.cnt === 0) {
+  if (cnt === 0) {
+    const bcrypt = require('bcryptjs');
     const hashedPassword = bcrypt.hashSync('admin', 10);
-    const stmt = db.prepare(
-      'INSERT INTO dashboard_users (username, password, role) VALUES (?, ?, ?)'
-    );
-    stmt.run('admin', hashedPassword, 'admin');
+    stmt.insertUser.run('admin', hashedPassword, 'admin');
     console.log('✅ Создан пользователь по умолчанию: admin / admin');
   }
 }
@@ -121,65 +121,77 @@ function initDatabase() {
 initDatabase();
 
 // ---------------------------------------------------------------------------
-// Экспорт объекта db и хелперов
+// Публичный API модуля
 // ---------------------------------------------------------------------------
+
+/**
+ * Получить посты с фильтрацией.
+ * @param {{ category?: string, urgency?: string, status?: string }} filters
+ */
+function getPosts(filters = {}) {
+  let query = 'SELECT * FROM actionable_posts WHERE 1=1';
+  const params = [];
+
+  if (filters.category) {
+    query += ' AND category = ?';
+    params.push(filters.category);
+  }
+  if (filters.urgency) {
+    query += ' AND urgency = ?';
+    params.push(filters.urgency);
+  }
+  if (filters.status) {
+    query += ' AND status = ?';
+    params.push(filters.status);
+  }
+
+  query += `
+    ORDER BY
+      CASE urgency WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END,
+      date DESC
+    LIMIT 200
+  `;
+
+  return db.prepare(query).all(...params);
+}
+
+/**
+ * Удалить пост по ID.
+ * @returns {boolean} true если строка была удалена
+ */
+function deletePost(id) {
+  const { changes } = stmt.deletePost.run(id);
+  return changes > 0;
+}
+
+/**
+ * Получить уникальные категории.
+ * @returns {string[]}
+ */
+function getCategories() {
+  return stmt.getCategories.all().map((row) => row.category);
+}
+
+/**
+ * Найти пользователя по username.
+ * @returns {{ id: number, username: string, password: string, role: string } | undefined}
+ */
+function findUserByUsername(username) {
+  return stmt.findUser.get(username);
+}
+
+/**
+ * Создать пользователя.
+ * @returns {{ lastInsertRowid: number }}
+ */
+function createUser(username, hashedPassword) {
+  return stmt.createUser.run(username, hashedPassword);
+}
+
 module.exports = {
-  db,
-
-  /** Получить все посты с фильтрацией */
-  getPosts(filters = {}) {
-    let query = 'SELECT * FROM actionable_posts WHERE 1=1';
-    const params = [];
-
-    if (filters.category) {
-      query += ' AND category = ?';
-      params.push(filters.category);
-    }
-    if (filters.urgency) {
-      query += ' AND urgency = ?';
-      params.push(filters.urgency);
-    }
-    if (filters.status) {
-      query += ' AND status = ?';
-      params.push(filters.status);
-    }
-
-    // Сортировка: high → medium → low, затем по дате
-    query += `
-      ORDER BY
-        CASE urgency WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END,
-        date DESC
-      LIMIT 200
-    `;
-
-    return db.prepare(query).all(...params);
-  },
-
-  /** Удалить пост по ID */
-  deletePost(id) {
-    const result = db.prepare('DELETE FROM actionable_posts WHERE id = ?').run(id);
-    return result.changes > 0;
-  },
-
-  /** Получить уникальные категории */
-  getCategories() {
-    return db
-      .prepare('SELECT DISTINCT category FROM actionable_posts ORDER BY category')
-      .all()
-      .map((r) => r.category);
-  },
-
-  /** Проверить пользователя по username */
-  findUserByUsername(username) {
-    return db
-      .prepare('SELECT * FROM dashboard_users WHERE username = ?')
-      .get(username);
-  },
-
-  /** Создать нового пользователя */
-  createUser(username, hashedPassword) {
-    return db
-      .prepare('INSERT INTO dashboard_users (username, password) VALUES (?, ?)')
-      .run(username, hashedPassword);
-  },
+  getPosts,
+  deletePost,
+  getCategories,
+  findUserByUsername,
+  createUser,
 };
