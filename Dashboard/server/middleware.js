@@ -1,5 +1,7 @@
 /**
  * middleware.js — JWT-верификация для защищённых эндпоинтов.
+ *
+ * Использует JWT-секрет из req.app.locals (Dependency Injection).
  */
 
 const jwt = require('jsonwebtoken');
@@ -7,7 +9,7 @@ const jwt = require('jsonwebtoken');
 /**
  * Express-middleware: проверяет заголовок Authorization: Bearer <token>.
  * При успехе — кладёт decoded payload в req.user.
- * При ошибке — возвращает 401.
+ * При ошибке — возвращает 401 или 403.
  */
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -17,15 +19,15 @@ function authMiddleware(req, res, next) {
   }
 
   const token = authHeader.split(' ')[1];
-  const secret = process.env.JWT_SECRET;
+  const jwtSecret = req.app.locals.jwtSecret;
 
-  if (!secret) {
-    console.error('❌ JWT_SECRET не настроен в .env');
+  if (!jwtSecret) {
+    console.error('❌ JWT_SECRET не настроен');
     return res.status(500).json({ error: 'Сервер не настроен' });
   }
 
   try {
-    const decoded = jwt.verify(token, secret);
+    const decoded = jwt.verify(token, jwtSecret);
     req.user = decoded; // { id, username, role }
     next();
   } catch (err) {

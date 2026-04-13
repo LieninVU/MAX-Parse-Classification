@@ -1,10 +1,10 @@
 /**
  * routes/post.routes.js — Эндпоинты работы с постами (защищённые).
- * Подключается с middleware authMiddleware в server.js.
+ *
+ * Использует БД из req.app.locals (Dependency Injection).
  */
 
 const express = require('express');
-const { getPosts, deletePost, getCategories } = require('../db');
 
 const router = express.Router();
 
@@ -14,6 +14,7 @@ const router = express.Router();
 router.get('/', (req, res) => {
   try {
     const { category, urgency, status } = req.query;
+    const { getPosts } = req.app.locals.db;
     const posts = getPosts({ category, urgency, status });
     res.json(posts);
   } catch (err) {
@@ -28,6 +29,7 @@ router.get('/', (req, res) => {
 router.delete('/:id', (req, res) => {
   try {
     const { id } = req.params;
+    const { deletePost } = req.app.locals.db;
     const deleted = deletePost(Number(id));
 
     if (!deleted) {
@@ -46,6 +48,7 @@ router.delete('/:id', (req, res) => {
 // ---------------------------------------------------------------------------
 router.get('/categories', (req, res) => {
   try {
+    const { getCategories } = req.app.locals.db;
     const categories = getCategories();
     res.json(categories);
   } catch (err) {

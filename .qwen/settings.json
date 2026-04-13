@@ -20,7 +20,11 @@
       "Bash(npm run *)",
       "Bash(netstat *)",
       "Bash(npx *)",
-      "Bash(npm start)"
+      "Bash(npm start)",
+      "Bash(.venv\\scripts\\python.exe *)",
+      "Bash(set *)",
+      "Bash(type *)",
+      "Bash(pip list)"
     ]
   },
   "$version": 3

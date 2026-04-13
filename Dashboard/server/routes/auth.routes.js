@@ -1,11 +1,12 @@
 /**
  * routes/auth.routes.js — Эндпоинты регистрации и авторизации.
+ *
+ * Использует БД и JWT-секрет из req.app.locals (Dependency Injection).
  */
 
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { findUserByUsername, createUser } = require('../db');
 
 const router = express.Router();
 
@@ -14,6 +15,7 @@ const router = express.Router();
 // ---------------------------------------------------------------------------
 router.post('/register', (req, res) => {
   const { username, password } = req.body;
+  const { findUserByUsername, createUser } = req.app.locals.db;
 
   // Валидация
   if (!username || !password) {
@@ -51,6 +53,8 @@ router.post('/register', (req, res) => {
 // ---------------------------------------------------------------------------
 router.post('/login', (req, res) => {
   const { username, password } = req.body;
+  const { findUserByUsername } = req.app.locals.db;
+  const jwtSecret = req.app.locals.jwtSecret;
 
   if (!username || !password) {
     return res.status(400).json({ error: 'Логин и пароль обязательны' });
@@ -68,7 +72,7 @@ router.post('/login', (req, res) => {
 
   const token = jwt.sign(
     { id: user.id, username: user.username, role: user.role },
-    process.env.JWT_SECRET,
+    jwtSecret,
     { expiresIn: '24h' }
   );
 
