@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,13 @@ CFG_OPENROUTER_KEY = _env("OPENROUTER_API_KEY", "")
 CFG_OPENROUTER_MODEL = _env("OPENROUTER_MODEL", "qwen/qwen3.6-plus:free")
 CFG_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 CFG_OPENROUTER_TIMEOUT = _env_int("OPENROUTER_TIMEOUT", 30)
+
+# Connection recovery parameters for LLM
+CFG_LLM_CONNECTION_CHECK_INTERVAL = _env_int("LLM_CONNECTION_CHECK_INTERVAL", 60)
+CFG_LLM_MAX_RECONNECT_ATTEMPTS = _env_int("LLM_MAX_RECONNECT_ATTEMPTS", 3)
+CFG_LLM_RECONNECT_BASE_DELAY = _env_int("LLM_RECONNECT_BASE_DELAY", 2)
+CFG_LLM_RECONNECT_MAX_DELAY = _env_int("LLM_RECONNECT_MAX_DELAY", 60)
+CFG_LLM_HEALTH_CHECK_TIMEOUT = _env_int("LLM_HEALTH_CHECK_TIMEOUT", 10)
 
 # Ограничение параллельных запросов к LLM (защита от rate limit)
 CFG_LLM_MAX_CONCURRENT = 3
@@ -334,7 +342,7 @@ SYSTEM_PROMPT = """\
 # =============================================================================
 
 class LLMClient:
-    """Клиент к OpenRouter API с ограничением параллелизма (semaphore)."""
+    """Клиент к OpenRouter API с ограничением параллелизма (semaphore) и автоматическим восстановлением соединения."""
 
     def __init__(
         self,
@@ -342,18 +350,35 @@ class LLMClient:
         model: str,
         timeout: int = 30,
         max_concurrent: int = 3,
+        connection_check_interval: int = 60,
+        max_reconnect_attempts: int = 3,
+        reconnect_base_delay: int = 2,
+        reconnect_max_delay: int = 60,
+        health_check_timeout: int = 10,
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._timeout = timeout
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._client: httpx.AsyncClient | None = None
+        
+        # Connection health tracking
+        self._connection_check_interval = connection_check_interval
+        self._max_reconnect_attempts = max_reconnect_attempts
+        self._reconnect_base_delay = reconnect_base_delay
+        self._reconnect_max_delay = reconnect_max_delay
+        self._health_check_timeout = health_check_timeout
+        self._last_successful_request = 0
+        self._connection_errors = 0
+        self._reconnect_attempts = 0
+        self._client_created_at = 0
 
     async def __aenter__(self) -> LLMClient:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self._timeout),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
+        self._client_created_at = time.time()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -368,6 +393,8 @@ class LLMClient:
             ValueError — невалидный JSON или структура ответа
         """
         async with self._semaphore:
+            # Проверяем здоровье соединения перед запросом
+            await self._ensure_connection_health()
             return await self._request(text)
 
     async def _request(self, text: str) -> AIAnalysis:
@@ -391,18 +418,40 @@ class LLMClient:
             "X-Title": "Max Parser Analytics",
         }
 
-        resp = await self._client.post(CFG_OPENROUTER_URL, json=payload, headers=headers)
-        resp.raise_for_status()
+        try:
+            resp = await self._client.post(CFG_OPENROUTER_URL, json=payload, headers=headers)
+            resp.raise_for_status()
 
-        data = resp.json()
+            data = resp.json()
 
-        if "choices" not in data:
-            error_info = data.get("error", data)
-            _logger.error("OpenRouter ответил без 'choices': %s", error_info)
-            raise ValueError(f"Unexpected OpenRouter response: {error_info}")
+            if "choices" not in data:
+                error_info = data.get("error", data)
+                _logger.error("OpenRouter ответил без 'choices': %s", error_info)
+                raise ValueError(f"Unexpected OpenRouter response: {error_info}")
 
-        content = data["choices"][0]["message"]["content"]
-        return self._parse_response(content)
+            content = data["choices"][0]["message"]["content"]
+            result = self._parse_response(content)
+            
+            # Успешный запрос - сбрасываем счетчики ошибок
+            self._connection_errors = 0
+            self._last_successful_request = time.time()
+            self._reconnect_attempts = 0
+            
+            return result
+            
+        except httpx.HTTPStatusError as e:
+            self._connection_errors += 1
+            if e.response.status_code >= 500:
+                _logger.warning("OpenRouter серверная ошибка: %s", e.response.status_code)
+                raise
+            else:
+                # 4xx ошибки - не пытаемся переподключиться
+                _logger.error("OpenRouter клиентская ошибка: %s", e.response.status_code)
+                raise
+        except httpx.RequestError as e:
+            self._connection_errors += 1
+            _logger.warning("OpenRouter ошибка соединения: %s", e)
+            raise
 
     @staticmethod
     def _parse_response(content: str) -> AIAnalysis:
@@ -433,6 +482,99 @@ class LLMClient:
 
         return AIAnalysis(**parsed)
 
+    async def _ensure_connection_health(self) -> None:
+        """Проверить здоровье соединения и восстановить при необходимости."""
+        if not self._client:
+            return
+            
+        current_time = time.time()
+        client_age = current_time - self._client_created_at
+        time_since_success = current_time - self._last_successful_request
+        
+        # Если клиент старый или много ошибок, проверяем соединение
+        need_health_check = (
+            (client_age > self._connection_check_interval * 2) or
+            (self._connection_errors >= 2) or
+            (self._last_successful_request > 0 and time_since_success > self._connection_check_interval * 3)
+        )
+        
+        if need_health_check:
+            await self._check_connection_health()
+            
+        # Если ошибок много, пытаемся переподключиться
+        if self._connection_errors >= 3:
+            await self._attempt_reconnection()
+
+    async def _check_connection_health(self) -> None:
+        """Проверить здоровье соединения с OpenRouter API."""
+        try:
+            # Легкий health check - пробуем получить модели
+            health_client = httpx.AsyncClient(timeout=self._health_check_timeout)
+            try:
+                resp = await health_client.get(
+                    "https://openrouter.ai/api/v1/models",
+                    headers={"Authorization": f"Bearer {self._api_key}"}
+                )
+                if resp.status_code == 200:
+                    _logger.debug("💓 OpenRouter соединение в порядке")
+                    self._connection_errors = 0
+                else:
+                    self._connection_errors += 1
+                    _logger.warning("🔍 Health check не прошел: HTTP %d", resp.status_code)
+            finally:
+                await health_client.aclose()
+                
+        except Exception as e:
+            _logger.warning("🔍 Ошибка health check: %s", e)
+            self._connection_errors += 1
+
+    async def _attempt_reconnection(self) -> None:
+        """Попытаться переподключиться к OpenRouter API."""
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            _logger.error("❌ Превышено максимальное количество попыток переподключения LLM (%d)", 
+                        self._max_reconnect_attempts)
+            return
+            
+        self._reconnect_attempts += 1
+        
+        # Экспоненциальный backoff
+        delay = min(
+            self._reconnect_base_delay * (2 ** (self._reconnect_attempts - 1)),
+            self._reconnect_max_delay
+        )
+        
+        _logger.info("🔄 Попытка переподключения LLM %d/%d через %ds", 
+                   self._reconnect_attempts, self._max_reconnect_attempts, delay)
+        
+        try:
+            await asyncio.sleep(delay)
+            
+            # Пересоздаем клиент
+            if self._client:
+                try:
+                    await self._client.aclose()
+                except Exception as e:
+                    _logger.warning("Ошибка при закрытии LLM клиента: %s", e)
+            
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self._timeout),
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            )
+            self._client_created_at = time.time()
+            
+            # Проверяем, что новый клиент работает
+            await self._check_connection_health()
+            
+            if self._connection_errors == 0:
+                _logger.info("✅ Переподключение LLM успешно")
+                self._reconnect_attempts = 0
+            
+        except Exception as e:
+            _logger.error("❌ Попытка переподключения LLM не удалась: %s", e, exc_info=True)
+            # Если еще есть попытки, планируем следующую
+            if self._reconnect_attempts < self._max_reconnect_attempts:
+                asyncio.create_task(self._attempt_reconnection())
+
 
 # =============================================================================
 # FASTAPI-ПРИЛОЖЕНИЕ
@@ -458,6 +600,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model=CFG_OPENROUTER_MODEL,
         timeout=CFG_OPENROUTER_TIMEOUT,
         max_concurrent=CFG_LLM_MAX_CONCURRENT,
+        connection_check_interval=CFG_LLM_CONNECTION_CHECK_INTERVAL,
+        max_reconnect_attempts=CFG_LLM_MAX_RECONNECT_ATTEMPTS,
+        reconnect_base_delay=CFG_LLM_RECONNECT_BASE_DELAY,
+        reconnect_max_delay=CFG_LLM_RECONNECT_MAX_DELAY,
+        health_check_timeout=CFG_LLM_HEALTH_CHECK_TIMEOUT,
     ) as llm:
         _llm = llm
         _logger.info(
@@ -587,9 +734,77 @@ async def get_stats() -> dict[str, Any]:
 
 
 @app.get("/health")
-async def health_check() -> dict[str, str]:
-    """Проверка работоспособности."""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+async def health_check() -> dict[str, Any]:
+    """Проверка работоспособности с детальной информацией."""
+    health_info = {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "service": "analytics_server",
+        "version": "1.0.0",
+        "components": {}
+    }
+    
+    # Проверяем базу данных
+    try:
+        if _store:
+            stats = _store.get_stats()
+            health_info["components"]["database"] = {
+                "status": "ok",
+                "total_actionable": stats["total_actionable"]
+            }
+        else:
+            health_info["components"]["database"] = {"status": "not_initialized"}
+    except Exception as e:
+        health_info["components"]["database"] = {
+            "status": "error",
+            "error": str(e)
+        }
+    
+    # Проверяем LLM клиент
+    try:
+        if _llm:
+            health_info["components"]["llm"] = {
+                "status": "ok",
+                "model": CFG_OPENROUTER_MODEL,
+                "connection_errors": _llm._connection_errors,
+                "last_successful_request": _llm._last_successful_request,
+                "reconnect_attempts": _llm._reconnect_attempts
+            }
+        else:
+            health_info["components"]["llm"] = {"status": "not_initialized"}
+    except Exception as e:
+        health_info["components"]["llm"] = {
+            "status": "error",
+            "error": str(e)
+        }
+    
+    # Определяем общий статус
+    component_statuses = [comp.get("status", "unknown") for comp in health_info["components"].values()]
+    if any(status in ["error", "not_initialized"] for status in component_statuses):
+        health_info["status"] = "degraded"
+    
+    return health_info
+
+
+@app.get("/health/ready")
+async def readiness_check() -> dict[str, str]:
+    """Проверка готовности сервиса к работе."""
+    if not _store or not _llm:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    # Проверяем, что база данных работает
+    try:
+        _store.get_stats()
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database not ready")
+    
+    return {"status": "ready", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/health/live")
+async def liveness_check() -> dict[str, str]:
+    """Проверка, что сервис запущен."""
+    return {"status": "alive", "timestamp": datetime.now().isoformat()}
 
 
 # =============================================================================

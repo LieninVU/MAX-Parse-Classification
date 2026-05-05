@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime
@@ -87,6 +88,13 @@ CFG_WEBHOOK_TIMEOUT = _env_int("WEBHOOK_TIMEOUT", 15)
 CFG_WEBHOOK_RETRIES = _env_int("WEBHOOK_RETRIES", 2)
 CFG_WEBHOOK_RETRY_DELAY = _env_int("WEBHOOK_RETRY_DELAY", 5)
 CFG_WEBHOOK_FAIL_SAFE = _env_bool("WEBHOOK_FAIL_SAFE", True)
+
+# Connection recovery parameters
+CFG_CONNECTION_CHECK_INTERVAL = _env_int("CONNECTION_CHECK_INTERVAL", 60)
+CFG_MAX_RECONNECT_ATTEMPTS = _env_int("MAX_RECONNECT_ATTEMPTS", 5)
+CFG_RECONNECT_BASE_DELAY = _env_int("RECONNECT_BASE_DELAY", 5)
+CFG_RECONNECT_MAX_DELAY = _env_int("RECONNECT_MAX_DELAY", 300)
+CFG_HEARTBEAT_TIMEOUT = _env_int("HEARTBEAT_TIMEOUT", 10)
 
 CFG_CHANNEL_IDS: list[int] = _env_list_int("TARGET_CHANNEL_IDS")
 CFG_LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
@@ -215,7 +223,7 @@ class WebhookClient:
     """Асинхронный клиент для отправки вебхуков на сервер аналитики.
 
     Использует один переиспользуемый aiohttp.ClientSession (keep-alive,
-    пул соединений).
+    пул соединений) с улучшенным механизмом переподключения.
     """
 
     def __init__(
@@ -225,13 +233,20 @@ class WebhookClient:
         retries: int = 2,
         retry_delay: int = 5,
         fail_safe: bool = True,
+        max_retry_delay: int = 300,
+        connection_check_interval: int = 60,
     ) -> None:
         self._url = url
         self._timeout = timeout
         self._retries = retries
         self._retry_delay = retry_delay
         self._fail_safe = fail_safe
+        self._max_retry_delay = max_retry_delay
+        self._connection_check_interval = connection_check_interval
         self._session: aiohttp.ClientSession | None = None
+        self._connection_errors = 0
+        self._last_successful_send = 0
+        self._session_created_at = 0
 
     async def __aenter__(self) -> WebhookClient:
         self._session = aiohttp.ClientSession(
@@ -251,13 +266,19 @@ class WebhookClient:
         """
         payload = msg.to_webhook_payload()
 
+        # Проверяем, не нужно ли пересоздать сессию
+        await self._ensure_session_health()
+
         for attempt in range(1, self._retries + 1):
             result = await self._try_send(payload, attempt)
             if result is not ...:  # sentinel: отправлено или окончательно провалено
                 return result  # type: ignore[return-value]
 
             if attempt < self._retries:
-                await asyncio.sleep(self._retry_delay)
+                # Экспоненциальный backoff
+                delay = min(self._retry_delay * (2 ** (attempt - 1)), self._max_retry_delay)
+                _logger.info("⏳ Ожидание %ds перед следующей попыткой", delay)
+                await asyncio.sleep(delay)
 
         _logger.error(
             "❌ Вебхук не доставлен после %d попыток (пост #%d)",
@@ -281,6 +302,9 @@ class WebhookClient:
         try:
             async with self._session.post(self._url, json=payload) as resp:
                 if resp.status == 200:
+                    # Успешная отправка - сбрасываем счетчики ошибок
+                    self._connection_errors = 0
+                    self._last_successful_send = time.time()
                     return await self._handle_200(resp, payload)
                 if resp.status == 429:
                     _logger.info("⏳ Rate limit сервера: #%d", payload["message_id"])
@@ -289,12 +313,15 @@ class WebhookClient:
 
         except asyncio.TimeoutError:
             _logger.warning("⏱️ Таймаут вебхука (попытка %d/%d)", attempt, self._retries)
+            self._connection_errors += 1
             return ...
         except aiohttp.ClientError as e:
             _logger.warning("🌐 Ошибка соединения (попытка %d/%d): %s", attempt, self._retries, e)
+            self._connection_errors += 1
             return ...
         except Exception as e:
             _logger.error("❌ Неожиданная ошибка вебхука: %s", e)
+            self._connection_errors += 1
             return ...
 
     async def _handle_200(self, resp: aiohttp.ClientResponse, payload: dict) -> dict | None:
@@ -319,8 +346,46 @@ class WebhookClient:
             payload["message_id"], resp.status, body[:200],
         )
         if resp.status >= 500:
+            self._connection_errors += 1
             return ...  # ретраить
         return None  # 4xx — не ретраим
+
+    async def _ensure_session_health(self) -> None:
+        """Проверить здоровье сессии и пересоздать при необходимости."""
+        if not self._session:
+            return
+            
+        current_time = time.time()
+        
+        # Если сессия старая или много ошибок соединения
+        session_age = current_time - self._session_created_at
+        time_since_success = current_time - self._last_successful_send
+        
+        need_recreation = (
+            (session_age > self._connection_check_interval * 5) or  # Старая сессия
+            (self._connection_errors >= 3) or  # Много ошибок
+            (self._last_successful_send > 0 and time_since_success > self._connection_check_interval * 3)
+        )
+        
+        if need_recreation:
+            _logger.info("🔄 Пересоздание сессии вебхука (ошибки: %d, возраст: %.1fs)", 
+                        self._connection_errors, session_age)
+            await self._recreate_session()
+
+    async def _recreate_session(self) -> None:
+        """Пересоздать HTTP сессию."""
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception as e:
+                _logger.warning("Ошибка при закрытии сессии: %s", e)
+        
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self._timeout),
+        )
+        self._session_created_at = time.time()
+        self._connection_errors = 0
+        _logger.debug("✅ Сессия вебхука пересоздана")
 
 
 # =============================================================================
@@ -386,11 +451,21 @@ class ChannelParser:
         webhook_retries: int = 2,
         webhook_retry_delay: int = 5,
         webhook_fail_safe: bool = True,
+        connection_check_interval: int = 60,
+        max_reconnect_attempts: int = 5,
+        reconnect_base_delay: int = 5,
+        reconnect_max_delay: int = 300,
+        heartbeat_timeout: int = 10,
     ) -> None:
         self._phone = phone
         self._target_channel_ids = target_channel_ids
         self._poll_interval = poll_interval
         self._fetch_backward = fetch_backward
+        self._connection_check_interval = connection_check_interval
+        self._max_reconnect_attempts = max_reconnect_attempts
+        self._reconnect_base_delay = reconnect_base_delay
+        self._reconnect_max_delay = reconnect_max_delay
+        self._heartbeat_timeout = heartbeat_timeout
 
         # Компоненты
         self._store = MessageStore(db_path)
@@ -400,6 +475,8 @@ class ChannelParser:
             retries=webhook_retries,
             retry_delay=webhook_retry_delay,
             fail_safe=webhook_fail_safe,
+            max_retry_delay=self._reconnect_max_delay,
+            connection_check_interval=self._connection_check_interval,
         )
 
         # Кэш
@@ -423,6 +500,12 @@ class ChannelParser:
         self._total_saved = 0
         self._total_webhooks_sent = 0
         self._total_webhooks_failed = 0
+        
+        # Connection health tracking
+        self._last_heartbeat = time.time()
+        self._connection_errors = 0
+        self._reconnect_attempts = 0
+        self._is_connected = False
 
     # -- публичный API --------------------------------------------------------
 
@@ -487,6 +570,11 @@ class ChannelParser:
         _logger.info("=" * 60)
         _logger.info("✅ Авторизация: %s (ID: %d)", name, me.id)
         _logger.info("=" * 60)
+        
+        self._is_connected = True
+        self._last_heartbeat = time.time()
+        self._connection_errors = 0
+        self._reconnect_attempts = 0
 
         channels = self._resolve_target_channels()
         if not channels:
@@ -504,6 +592,7 @@ class ChannelParser:
         _logger.info("📋 Стартовые позиции в БД: %s", self._last_ids)
 
         asyncio.create_task(self._poll_loop(channels))
+        asyncio.create_task(self._connection_health_checker())
 
     # -- разрешение каналов ---------------------------------------------------
 
@@ -556,14 +645,25 @@ class ChannelParser:
 
         while not stop_event.is_set():
             try:
+                # Проверка состояния соединения перед polling
+                if not await self._ensure_connection():
+                    _logger.warning("⚠️ Соединение не установлено, пропускаем polling")
+                    await asyncio.sleep(min(self._poll_interval, 30))
+                    continue
+                    
                 for cid in channel_ids:
+                    if stop_event.is_set():
+                        break
                     await self._poll_channel(cid)
+                    
+                self._last_heartbeat = time.time()
                 _logger.info("💤 Сон %ds...", self._poll_interval)
                 await asyncio.sleep(self._poll_interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 _logger.error("Ошибка polling цикла: %s", e, exc_info=True)
+                self._connection_errors += 1
                 await asyncio.sleep(5)
 
     async def _poll_channel(self, channel_id: int) -> None:
@@ -580,6 +680,7 @@ class ChannelParser:
                 return
 
             self._total_fetched += len(messages)
+            self._connection_errors = 0  # Reset error counter on successful operation
 
             # Фильтр новых (msg.id — строка)
             new_messages = [m for m in messages if int(m.id) > last_id]
@@ -617,6 +718,88 @@ class ChannelParser:
 
         except Exception as e:
             _logger.error("Ошибка опроса канала %d: %s", channel_id, e, exc_info=True)
+            self._connection_errors += 1
+            # Если ошибок много, возможно соединение потеряно
+            if self._connection_errors >= 3:
+                _logger.warning("🔄 Множественные ошибки соединения, пытаемся переподключиться")
+                self._is_connected = False
+
+    async def get_health_status(self) -> dict[str, Any]:
+        """Получить статус здоровья парсера."""
+        current_time = time.time()
+        
+        health_info = {
+            "status": "ok",
+            "timestamp": datetime.now().isoformat(),
+            "service": "channel_parser",
+            "version": "1.0.0",
+            "components": {}
+        }
+        
+        # Статус MAX клиента
+        try:
+            max_client_status = {
+                "is_connected": self._is_connected,
+                "connection_errors": self._connection_errors,
+                "reconnect_attempts": self._reconnect_attempts,
+                "last_heartbeat": self._last_heartbeat,
+                "time_since_heartbeat": current_time - self._last_heartbeat
+            }
+            
+            if self._connection_errors >= 3 or not self._is_connected:
+                max_client_status["status"] = "degraded"
+            else:
+                max_client_status["status"] = "ok"
+                
+            health_info["components"]["max_client"] = max_client_status
+        except Exception as e:
+            health_info["components"]["max_client"] = {
+                "status": "error",
+                "error": str(e)
+            }
+        
+        # Статус вебхука
+        try:
+            webhook_status = {
+                "connection_errors": self._webhook._connection_errors,
+                "last_successful_send": self._webhook._last_successful_send,
+                "session_age": current_time - self._webhook._session_created_at if self._webhook._session_created_at > 0 else 0
+            }
+            
+            if self._webhook._connection_errors >= 3:
+                webhook_status["status"] = "degraded"
+            else:
+                webhook_status["status"] = "ok"
+                
+            health_info["components"]["webhook"] = webhook_status
+        except Exception as e:
+            health_info["components"]["webhook"] = {
+                "status": "error",
+                "error": str(e)
+            }
+        
+        # Статус базы данных
+        try:
+            # Простая проверка - пытаемся получить статистику
+            last_id = self._store.get_last_message_id(0) if 0 in self._last_ids else 0
+            db_status = {
+                "status": "ok",
+                "total_saved": self._total_saved,
+                "total_fetched": self._total_fetched
+            }
+            health_info["components"]["database"] = db_status
+        except Exception as e:
+            health_info["components"]["database"] = {
+                "status": "error",
+                "error": str(e)
+            }
+        
+        # Определяем общий статус
+        component_statuses = [comp.get("status", "unknown") for comp in health_info["components"].values()]
+        if any(status in ["error", "degraded"] for status in component_statuses):
+            health_info["status"] = "degraded"
+        
+        return health_info
 
     async def _send_webhook_safe(self, data: MessageData) -> None:
         """Отправить вебхук с подсчётом статистики."""
@@ -629,6 +812,99 @@ class ChannelParser:
         except Exception as e:
             _logger.error("Ошибка вебхука: %s", e)
             self._total_webhooks_failed += 1
+
+    async def _connection_health_checker(self) -> None:
+        """Периодическая проверка состояния соединения."""
+        _logger.info("🫀 Проверка состояния соединения запущена (интервал %ds)", self._connection_check_interval)
+        
+        while not self._client._stop_event.is_set():
+            try:
+                await asyncio.sleep(self._connection_check_interval)
+                
+                if self._client._stop_event.is_set():
+                    break
+                    
+                # Проверяем, как давно было последнее успешное взаимодействие
+                time_since_heartbeat = time.time() - self._last_heartbeat
+                
+                if time_since_heartbeat > self._connection_check_interval * 2:
+                    _logger.warning("⚠️ Долгое отсутствие активности: %.1fs", time_since_heartbeat)
+                    await self._check_connection_health()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _logger.error("Ошибка в health checker: %s", e, exc_info=True)
+
+    async def _check_connection_health(self) -> None:
+        """Проверить здоровье соединения с MAX API."""
+        try:
+            # Пробуем получить информацию о себе - это легкая операция
+            me = await self._client.get_me()
+            if me:
+                _logger.debug("💓 Соединение в порядке")
+                self._last_heartbeat = time.time()
+                self._connection_errors = 0
+                self._is_connected = True
+            else:
+                raise Exception("Не удалось получить информацию о пользователе")
+                
+        except Exception as e:
+            _logger.warning("🔍 Проверка здоровья не прошла: %s", e)
+            self._connection_errors += 1
+            self._is_connected = False
+            
+            # Если это не первая ошибка, пробуем переподключиться
+            if self._connection_errors >= 2:
+                await self._attempt_reconnection()
+
+    async def _ensure_connection(self) -> bool:
+        """Убедиться, что соединение установлено."""
+        if self._is_connected and self._connection_errors == 0:
+            return True
+            
+        try:
+            await self._check_connection_health()
+            return self._is_connected
+        except Exception:
+            return False
+
+    async def _attempt_reconnection(self) -> None:
+        """Попытаться переподключиться к MAX API."""
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            _logger.error("❌ Превышено максимальное количество попыток переподключения (%d)", self._max_reconnect_attempts)
+            return
+            
+        self._reconnect_attempts += 1
+        
+        # Экспоненциальный backoff с ограничением
+        delay = min(
+            self._reconnect_base_delay * (2 ** (self._reconnect_attempts - 1)),
+            self._reconnect_max_delay
+        )
+        
+        _logger.info("🔄 Попытка переподключения %d/%d через %ds", self._reconnect_attempts, self._max_reconnect_attempts, delay)
+        
+        try:
+            await asyncio.sleep(delay)
+            
+            # Перезапускаем клиент
+            await self._client_close()
+            await asyncio.sleep(2)
+            
+            await self._client.start()
+            
+            # Если успешно, сбрасываем счетчики
+            self._is_connected = True
+            self._connection_errors = 0
+            self._last_heartbeat = time.time()
+            _logger.info("✅ Переподключение успешно")
+            
+        except Exception as e:
+            _logger.error("❌ Попытка переподключения не удалась: %s", e, exc_info=True)
+            # Если еще есть попытки, планируем следующую
+            if self._reconnect_attempts < self._max_reconnect_attempts:
+                asyncio.create_task(self._attempt_reconnection())
 
 
 # =============================================================================
@@ -648,6 +924,11 @@ async def _main() -> None:
         webhook_retries=CFG_WEBHOOK_RETRIES,
         webhook_retry_delay=CFG_WEBHOOK_RETRY_DELAY,
         webhook_fail_safe=CFG_WEBHOOK_FAIL_SAFE,
+        connection_check_interval=CFG_CONNECTION_CHECK_INTERVAL,
+        max_reconnect_attempts=CFG_MAX_RECONNECT_ATTEMPTS,
+        reconnect_base_delay=CFG_RECONNECT_BASE_DELAY,
+        reconnect_max_delay=CFG_RECONNECT_MAX_DELAY,
+        heartbeat_timeout=CFG_HEARTBEAT_TIMEOUT,
     )
 
     parser.register_handlers()
