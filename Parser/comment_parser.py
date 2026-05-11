@@ -96,6 +96,10 @@ CFG_RECONNECT_BASE_DELAY = _env_int("RECONNECT_BASE_DELAY", 5)
 CFG_RECONNECT_MAX_DELAY = _env_int("RECONNECT_MAX_DELAY", 300)
 CFG_HEARTBEAT_TIMEOUT = _env_int("HEARTBEAT_TIMEOUT", 10)
 
+# Периодический перезапуск
+CFG_RESTART_ENABLED = _env_bool("RESTART_ENABLED", True)
+CFG_RESTART_INTERVAL = _env_int("RESTART_INTERVAL", 30)  # минуты между сессиями
+
 CFG_CHANNEL_IDS: list[int] = _env_list_int("TARGET_CHANNEL_IDS")
 CFG_LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
 
@@ -911,8 +915,8 @@ class ChannelParser:
 # ТОЧКА ВХОДА
 # =============================================================================
 
-async def _main() -> None:
-    parser = ChannelParser(
+def _build_parser() -> ChannelParser:
+    return ChannelParser(
         phone=CFG_PHONE,
         target_channel_ids=CFG_CHANNEL_IDS,
         db_path=CFG_DB_PATH,
@@ -931,8 +935,35 @@ async def _main() -> None:
         heartbeat_timeout=CFG_HEARTBEAT_TIMEOUT,
     )
 
-    parser.register_handlers()
-    await parser.run()
+
+async def _main() -> None:
+    if not CFG_RESTART_ENABLED:
+        parser = _build_parser()
+        parser.register_handlers()
+        await parser.run()
+        return
+
+    session = 0
+    while True:
+        session += 1
+        _logger.info("🔁 Сессия #%d запущена", session)
+        try:
+            parser = _build_parser()
+            parser.register_handlers()
+            await parser.run()
+        except KeyboardInterrupt:
+            _logger.info("⏹ Остановка по Ctrl+C")
+            break
+        except Exception as e:
+            _logger.error("💥 Сессия #%d завершилась с ошибкой: %s", session, e, exc_info=True)
+
+        sleep_sec = CFG_RESTART_INTERVAL * 60
+        _logger.info("😴 Пауза %d мин перед следующей сессией...", CFG_RESTART_INTERVAL)
+        try:
+            await asyncio.sleep(sleep_sec)
+        except KeyboardInterrupt:
+            _logger.info("⏹ Остановка по Ctrl+C")
+            break
 
 
 if __name__ == "__main__":

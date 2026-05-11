@@ -418,40 +418,58 @@ class LLMClient:
             "X-Title": "Max Parser Analytics",
         }
 
-        try:
-            resp = await self._client.post(CFG_OPENROUTER_URL, json=payload, headers=headers)
-            resp.raise_for_status()
+        last_exc: Exception | None = None
+        for attempt in range(1, self._max_reconnect_attempts + 2):  # +1 исходная + N retry
+            try:
+                resp = await self._client.post(CFG_OPENROUTER_URL, json=payload, headers=headers)
+                resp.raise_for_status()
 
-            data = resp.json()
+                data = resp.json()
 
-            if "choices" not in data:
-                error_info = data.get("error", data)
-                _logger.error("OpenRouter ответил без 'choices': %s", error_info)
-                raise ValueError(f"Unexpected OpenRouter response: {error_info}")
+                if "choices" not in data:
+                    error_info = data.get("error", data)
+                    _logger.error("OpenRouter ответил без 'choices': %s", error_info)
+                    raise ValueError(f"Unexpected OpenRouter response: {error_info}")
 
-            content = data["choices"][0]["message"]["content"]
-            result = self._parse_response(content)
-            
-            # Успешный запрос - сбрасываем счетчики ошибок
-            self._connection_errors = 0
-            self._last_successful_request = time.time()
-            self._reconnect_attempts = 0
-            
-            return result
-            
-        except httpx.HTTPStatusError as e:
-            self._connection_errors += 1
-            if e.response.status_code >= 500:
-                _logger.warning("OpenRouter серверная ошибка: %s", e.response.status_code)
-                raise
-            else:
-                # 4xx ошибки - не пытаемся переподключиться
-                _logger.error("OpenRouter клиентская ошибка: %s", e.response.status_code)
-                raise
-        except httpx.RequestError as e:
-            self._connection_errors += 1
-            _logger.warning("OpenRouter ошибка соединения: %s", e)
-            raise
+                content = data["choices"][0]["message"]["content"]
+                result = self._parse_response(content)
+
+                self._connection_errors = 0
+                self._last_successful_request = time.time()
+                self._reconnect_attempts = 0
+                return result
+
+            except httpx.HTTPStatusError as e:
+                self._connection_errors += 1
+                if e.response.status_code == 429:
+                    raise  # rate limit — не ретраим
+                if e.response.status_code < 500:
+                    raise  # 4xx — не ретраим
+                last_exc = e
+                _logger.warning("⚠️ OpenRouter 5xx (attempt %d): %s", attempt, e.response.status_code)
+            except httpx.RequestError as e:
+                self._connection_errors += 1
+                last_exc = e
+                _logger.warning("⚠️ OpenRouter ошибка соединения (attempt %d): %s", attempt, type(e).__name__)
+
+            if attempt <= self._max_reconnect_attempts:
+                delay = min(
+                    self._reconnect_base_delay * (2 ** (attempt - 1)),
+                    self._reconnect_max_delay,
+                )
+                _logger.info("⏳ Повтор через %ds...", delay)
+                await asyncio.sleep(delay)
+                # Пересоздаём клиент при ошибке соединения
+                try:
+                    await self._client.aclose()
+                except Exception:
+                    pass
+                self._client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(self._timeout),
+                    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                )
+
+        raise last_exc  # type: ignore[misc]
 
     @staticmethod
     def _parse_response(content: str) -> AIAnalysis:
